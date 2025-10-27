@@ -1,0 +1,276 @@
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from skimage.transform import resize
+from PIL import Image
+import math
+import random
+import torch.nn.functional as F
+
+# =========================
+# 0) Device and global params
+# =========================
+device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+print("Running on:", device)
+
+torch.manual_seed(0)
+np.random.seed(0)
+random.seed(0)
+
+# Format and sampling (only for objects and display; ePIE itself performs FFT within the patch)
+Nx = Ny = 500
+
+# ePIE parameters (similar to your PIE, with additional probe update related parameters)
+patch = 128          # Patch size (region = patch x patch)
+step  = 32           # Scanning step (≈30-50% of FWHM, ensure 60-80% overlap)
+num_iters = 200     # ePIE usually random access + faster convergence, can be reduced
+beta_o = 1           # Object update step size (similar to your beta)
+beta_p = 0.01        # Probe update step size (slightly smaller than object for stability)
+alpha_o = 1e-10      # Object update stability term (prevent division by 0)
+alpha_p = 1e-10      # Probe update stability term
+renorm_probe_each = 1  # Every how many steps to renormalize probe energy (1 means renormalize after each patch)
+
+#--------------------------------------------------------------------------------------------------------------------------
+# mPIE parameters
+mu_o = 0.7          # 对象动量系数（0~1，越大动量越强）
+mu_p = 0.2          # 探针动量系数
+use_nesterov = False # 如需 Nesterov lookahead，加 True（建议先用 False）
+grad_clip = 5.0      # 可选：梯度/更新范数裁剪，避免爆炸（0 或 None 关闭）
+
+
+
+#--------------------------------------------------------------------------------------------------------------------------
+
+gamma = 0.5  # Optional: Probe energy renormalization factor (if not wanting to renormalize every time, can set to 1.0)
+eps = 1e-12  # Prevent division by zero
+# =========================
+# 1) Gaussian Probe (defined within the patch size)
+# =========================
+def make_gaussian_probe(patch, sigma_px, device="cpu", energy_norm=True):
+    """
+    Returns a Gaussian complex amplitude probe within the patch size (phase is zero).
+    sigma_px: Gaussian standard deviation (pixels)
+    energy_norm: If True, ensures sum |P|^2 = 1
+    """
+    yy, xx = torch.meshgrid(torch.arange(patch, device=device),
+                            torch.arange(patch, device=device),
+                            indexing='ij')
+    cy, cx = (patch-1)/2.0, (patch-1)/2.0
+    P = torch.exp(-((xx-cx)**2 + (yy-cy)**2) / (2*sigma_px**2))
+    P = P.to(torch.complex64)
+    if energy_norm:
+        P = P / torch.sqrt(torch.sum(torch.abs(P)**2) + 1e-20)
+    return P
+
+# Set Gaussian width (pixels)
+sigma_px = 0.5 * patch / 2.355
+probe_true = make_gaussian_probe(patch, sigma_px, device=device, energy_norm=True)
+
+# Initial probe guess (can be slightly off from true value; here example is a slightly wider Gaussian)
+sigma_guess = 0.6 * patch / 2.355
+probe_guess = make_gaussian_probe(patch, sigma_guess, device=device, energy_norm=True)
+
+# ===========================================================================================
+# 2) Construct object (complex transmission function): Lenna (with both amplitude + phase)
+# ===========================================================================================
+
+def normalize01(arr, eps=1e-12):
+    arr = np.asarray(arr, dtype=np.float32)
+    mn, mx = arr.min(), arr.max()
+    if mx - mn < eps:
+        return np.zeros_like(arr)
+    return (arr - mn) / (mx - mn)
+
+# Read Lenna and convert to grayscale
+try:
+    img = Image.open("lenna.jpg").convert("L")
+except Exception:
+    print("[WARN] lenna.jpg not found, using random phase plate instead")
+    arr = np.random.rand(Nx, Ny).astype(np.float32)
+else:
+    arr = np.array(img, dtype=np.float32)
+
+# Resize to (Nx, Ny)
+arr = resize(arr, (Nx, Ny), anti_aliasing=True, preserve_range=True)
+arr = normalize01(arr)  # [0,1]
+
+# Amplitude: map grayscale to [amp_min, amp_min + amp_contrast]
+amp_min      = 0.2
+amp_contrast = 0.8
+obj_amp = amp_min + amp_contrast * arr
+obj_amp = torch.tensor(obj_amp, dtype=torch.float32, device=device)
+
+# Phase: Use a smoothed version of the grayscale to map to [-phase_depth, +phase_depth]
+phase_depth = math.pi
+_t = torch.tensor(arr, dtype=torch.float32, device=device)
+_t4 = _t[None, None, ...]
+blur_ksz = 17
+pad = blur_ksz // 2
+_t_blur = F.avg_pool2d(F.pad(_t4, (pad, pad, pad, pad), mode='reflect'), kernel_size=blur_ksz, stride=1).squeeze(0).squeeze(0)
+obj_phase = (_t_blur - 0.5) * (2.0 * phase_depth)
+
+# Complex transmission function (ground truth)
+obj_true = obj_amp * torch.exp(1j * obj_phase)
+
+# ===========================================================================================
+# 3) Scanning Path (Top-Left Corner Coordinates)
+# ===========================================================================================
+positions = [(x0, y0)
+             for x0 in range(0, Nx - patch + 1, step)
+             for y0 in range(0, Ny - patch + 1, step)]
+print(f"#positions = {len(positions)}")
+
+def crop(t, x0, y0, patch):
+    return t[x0:x0+patch, y0:y0+patch]
+
+# ===========================================================================================
+# 4) Generate Measurements (Intensity I = |F{ψ}|^2)
+# ===========================================================================================
+measuredI = []
+with torch.no_grad():
+    for (x0, y0) in positions:
+        Og = crop(obj_true, x0, y0, patch)
+        psi = Og * probe_true
+        W   = torch.fft.fftshift(torch.fft.fft2(psi))
+        measuredI.append(torch.abs(W)**2)
+
+# ===========================================================================================
+# 5) mPIE engine 
+# ===========================================================================================
+obj_guess  = torch.ones_like(obj_true, dtype=torch.complex64, device=device)
+probe_curr = probe_guess.clone()
+
+# 动量缓存：对象是全幅；探针是 patch 尺寸
+v_obj   = torch.zeros_like(obj_guess,  dtype=torch.complex64)
+v_probe = torch.zeros_like(probe_curr, dtype=torch.complex64)
+
+sse_list = []
+
+for it in range(1, num_iters + 1):
+    total_err = 0.0
+    tot_pix   = 0
+
+    # 随机访问扫描序列（与 ePIE / rPIE 一致）
+    order = list(range(len(positions)))
+    random.shuffle(order)
+
+    for k, idx in enumerate(order):
+        x0, y0 = positions[idx]
+
+        # 取当前窗口
+        if use_nesterov:
+            # Nesterov 预读（lookahead）：在动量方向上“先走一步”计算梯度
+            Og_base_patch = obj_guess[x0:x0+patch, y0:y0+patch]
+            v_slice = v_obj[x0:x0+patch, y0:y0+patch]
+            Og = Og_base_patch + mu_o * v_slice
+            Pg = probe_curr + mu_p * v_probe
+        else:
+            Og = obj_guess[x0:x0+patch, y0:y0+patch]
+            Pg = probe_curr
+
+        # 前向 & 幅度约束（与 rPIE 相同）
+        psi_g = Og * Pg
+        Wg    = torch.fft.fftshift(torch.fft.fft2(psi_g))
+        amp_meas = torch.sqrt(measuredI[idx] + 1e-12)
+        Wc = amp_meas * torch.exp(1j * torch.angle(Wg))
+        psi_c = torch.fft.ifft2(torch.fft.ifftshift(Wc))
+
+        # 残差
+        dpsi = psi_c - psi_g
+
+        # rPIE 风格分母（mPIE = rPIE 梯度方向 + 动量加速）
+        denom_o = (1 - gamma) * torch.max(torch.abs(Pg)**2) + gamma * (torch.abs(Pg)**2) + eps + alpha_o
+        denom_p = (1 - gamma) * torch.max(torch.abs(Og)**2) + gamma * (torch.abs(Og)**2) + eps + alpha_p
+
+        # 梯度（对对象/探针）
+        g_o = torch.conj(Pg) * dpsi / denom_o
+        g_p = torch.conj(Og) * dpsi / denom_p
+
+        # （可选）裁剪，稳定训练
+        if grad_clip and grad_clip > 0:
+            # 用 L2 范数做简单裁剪
+            go_norm = torch.linalg.vector_norm(g_o)
+            if go_norm.real > grad_clip:
+                g_o = g_o * (grad_clip / (go_norm.real + 1e-12))
+            gp_norm = torch.linalg.vector_norm(g_p)
+            if gp_norm.real > grad_clip:
+                g_p = g_p * (grad_clip / (gp_norm.real + 1e-12))
+
+        # ===== mPIE 的动量更新 =====
+        # 对象（窗口更新到全图动量缓存，再写回对象）
+        v_slice = v_obj[x0:x0+patch, y0:y0+patch]
+        v_slice = mu_o * v_slice + beta_o * g_o
+        v_obj[x0:x0+patch, y0:y0+patch] = v_slice
+
+        Og_new = Og + v_slice
+        obj_guess[x0:x0+patch, y0:y0+patch] = Og_new
+
+        # 探针（全局同一块）
+        v_probe = mu_p * v_probe + beta_p * g_p
+        probe_curr = Pg + v_probe
+
+        # （可选）探针能量归一，防止漂移
+        if renorm_probe_each and ((k + 1) % renorm_probe_each == 0):
+            energy = torch.sqrt(torch.sum(torch.abs(probe_curr)**2) + 1e-20)
+            probe_curr = probe_curr / energy
+
+        # 记录 SSE（与原来一致）
+        total_err += torch.sum((torch.sqrt(measuredI[idx]) - torch.abs(Wg))**2).item()
+        tot_pix   += Wg.numel()
+
+    sse_list.append(total_err / tot_pix)
+
+    if it % 100 == 0:
+        print(f"[mPIE] Iter {it}/{num_iters}, SSE={sse_list[-1]:.3e}")
+
+print("mPIE Finished.")
+
+# ===========================================================================================
+# 6) Results Visualization
+# ===========================================================================================
+obj_true_np   = obj_true.detach().cpu().numpy()
+obj_guess_np  = obj_guess.detach().cpu().numpy()
+probe_true_np = probe_true.detach().cpu().numpy()
+probe_rec_np  = probe_curr.detach().cpu().numpy()
+
+plt.figure(figsize=(13,9))
+
+plt.subplot(3,3,1)
+plt.title("True Amplitude")
+plt.imshow(np.abs(obj_true_np), cmap="gray", origin="upper")
+plt.colorbar()
+
+plt.subplot(3,3,2)
+plt.title("Reconstructed Amplitude (mPIE)")
+plt.imshow(np.abs(obj_guess_np), cmap="gray", origin="upper")
+plt.colorbar()
+
+plt.subplot(3,3,4)
+plt.title("True Phase")
+plt.imshow(np.angle(obj_true_np), cmap="twilight", origin="upper")
+plt.colorbar()
+
+plt.subplot(3,3,5)
+plt.title("Reconstructed Phase (mPIE)")
+plt.imshow(np.angle(obj_guess_np), cmap="twilight", origin="upper")
+plt.colorbar()
+
+plt.subplot(1,3,3)
+plt.title("SSE Convergence")
+plt.semilogy(sse_list, "b-")
+plt.xlabel("Iteration (shuffled scans)")
+plt.ylabel("SSE (log scale)")
+
+# Probe comparison
+plt.subplot(3,3,7)
+plt.title("True Probe |P|")
+plt.imshow(np.abs(probe_true_np), cmap="gray", origin="upper")
+plt.colorbar()
+
+plt.subplot(3,3,8)
+plt.title("Reconstructed Probe |P| (mPIE)")
+plt.imshow(np.abs(probe_rec_np), cmap="gray", origin="upper")
+plt.colorbar()
+
+plt.tight_layout()
+plt.show()
