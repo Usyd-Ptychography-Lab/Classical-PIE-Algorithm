@@ -32,10 +32,10 @@ renorm_probe_each = 1  # Every how many steps to renormalize probe energy (1 mea
 
 #--------------------------------------------------------------------------------------------------------------------------
 # mPIE parameters
-mu_o = 0.7          # 对象动量系数（0~1，越大动量越强）
-mu_p = 0.2          # 探针动量系数
-use_nesterov = False # 如需 Nesterov lookahead，加 True（建议先用 False）
-grad_clip = 5.0      # 可选：梯度/更新范数裁剪，避免爆炸（0 或 None 关闭）
+mu_o = 0.7          # Object momentum coefficient (0~1, the larger the momentum, the stronger the momentum)
+mu_p = 0.2          # Probe momentum coefficient
+use_nesterov = False # If Nesterov lookahead is needed, add True (it is recommended to use False first)）
+grad_clip = 5.0      # Optional: Gradient/update norm clipping to avoid explosion (0 or None off)
 
 
 
@@ -140,7 +140,7 @@ with torch.no_grad():
 obj_guess  = torch.ones_like(obj_true, dtype=torch.complex64, device=device)
 probe_curr = probe_guess.clone()
 
-# 动量缓存：对象是全幅；探针是 patch 尺寸
+# Momentum cache: The object is full frame; Probe is patch size
 v_obj   = torch.zeros_like(obj_guess,  dtype=torch.complex64)
 v_probe = torch.zeros_like(probe_curr, dtype=torch.complex64)
 
@@ -150,16 +150,16 @@ for it in range(1, num_iters + 1):
     total_err = 0.0
     tot_pix   = 0
 
-    # 随机访问扫描序列（与 ePIE / rPIE 一致）
+    # Random access scanning sequence (consistent with ePIE/rPIE)
     order = list(range(len(positions)))
     random.shuffle(order)
 
     for k, idx in enumerate(order):
         x0, y0 = positions[idx]
 
-        # 取当前窗口
+        # Retrieve the current window
         if use_nesterov:
-            # Nesterov 预读（lookahead）：在动量方向上“先走一步”计算梯度
+            # Nesterov Look ahead: Calculate the gradient by taking a step ahead in the momentum direction
             Og_base_patch = obj_guess[x0:x0+patch, y0:y0+patch]
             v_slice = v_obj[x0:x0+patch, y0:y0+patch]
             Og = Og_base_patch + mu_o * v_slice
@@ -168,27 +168,27 @@ for it in range(1, num_iters + 1):
             Og = obj_guess[x0:x0+patch, y0:y0+patch]
             Pg = probe_curr
 
-        # 前向 & 幅度约束（与 rPIE 相同）
+        # Forward & Amplitude Constraints (Same as rPIE)
         psi_g = Og * Pg
         Wg    = torch.fft.fftshift(torch.fft.fft2(psi_g))
         amp_meas = torch.sqrt(measuredI[idx] + 1e-12)
         Wc = amp_meas * torch.exp(1j * torch.angle(Wg))
         psi_c = torch.fft.ifft2(torch.fft.ifftshift(Wc))
 
-        # 残差
+        # residual
         dpsi = psi_c - psi_g
 
-        # rPIE 风格分母（mPIE = rPIE 梯度方向 + 动量加速）
+        # rPIE style denominator（mPIE = rPIE gradient direction + momentum acceleration）
         denom_o = (1 - gamma) * torch.max(torch.abs(Pg)**2) + gamma * (torch.abs(Pg)**2) + eps + alpha_o
         denom_p = (1 - gamma) * torch.max(torch.abs(Og)**2) + gamma * (torch.abs(Og)**2) + eps + alpha_p
 
-        # 梯度（对对象/探针）
+        # Gradient (for objects/probes)
         g_o = torch.conj(Pg) * dpsi / denom_o
         g_p = torch.conj(Og) * dpsi / denom_p
 
-        # （可选）裁剪，稳定训练
+        # (Optional) Crop, stable training
         if grad_clip and grad_clip > 0:
-            # 用 L2 范数做简单裁剪
+            # Using L2 norm for simple clipping
             go_norm = torch.linalg.vector_norm(g_o)
             if go_norm.real > grad_clip:
                 g_o = g_o * (grad_clip / (go_norm.real + 1e-12))
@@ -196,8 +196,8 @@ for it in range(1, num_iters + 1):
             if gp_norm.real > grad_clip:
                 g_p = g_p * (grad_clip / (gp_norm.real + 1e-12))
 
-        # ===== mPIE 的动量更新 =====
-        # 对象（窗口更新到全图动量缓存，再写回对象）
+        # ===== mPIE momentum update =====
+        # Object (update the window to the full image momentum cache, and then write back to the object)
         v_slice = v_obj[x0:x0+patch, y0:y0+patch]
         v_slice = mu_o * v_slice + beta_o * g_o
         v_obj[x0:x0+patch, y0:y0+patch] = v_slice
@@ -205,16 +205,16 @@ for it in range(1, num_iters + 1):
         Og_new = Og + v_slice
         obj_guess[x0:x0+patch, y0:y0+patch] = Og_new
 
-        # 探针（全局同一块）
+        # Probe (global same block)
         v_probe = mu_p * v_probe + beta_p * g_p
         probe_curr = Pg + v_probe
 
-        # （可选）探针能量归一，防止漂移
+        # (Optional) Normalize probe energy to prevent drift
         if renorm_probe_each and ((k + 1) % renorm_probe_each == 0):
             energy = torch.sqrt(torch.sum(torch.abs(probe_curr)**2) + 1e-20)
             probe_curr = probe_curr / energy
 
-        # 记录 SSE（与原来一致）
+        # Record SSE (consistent with original)
         total_err += torch.sum((torch.sqrt(measuredI[idx]) - torch.abs(Wg))**2).item()
         tot_pix   += Wg.numel()
 
@@ -274,3 +274,4 @@ plt.colorbar()
 
 plt.tight_layout()
 plt.show()
+
